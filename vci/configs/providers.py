@@ -135,7 +135,7 @@ class OpenRouterProvider:
             f"{self.config.base_url}/chat/completions",
             headers=self.headers,
             json=payload,
-            timeout=120
+            timeout=300  # 5 minutes for slow models with web search
         )
 
         if response.status_code != 200:

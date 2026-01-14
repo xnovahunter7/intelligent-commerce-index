@@ -21,6 +21,8 @@ from typing import List, Optional, Dict, Any
 from ..configs.settings import SETTINGS, VERTICALS
 from ..configs.providers import MODEL_REGISTRY, get_openrouter_model_id
 from ..harness.grounded_call import make_grounded_call, TestCase
+from ..harness.grounding_pipeline import run_grounding_pipeline
+from ..harness.autograder import grade_response
 
 
 def get_results_dir(model: str, vertical: str, run: int) -> Path:
@@ -36,8 +38,8 @@ def get_task_dir(results_dir: Path, task_id: str) -> Path:
 
 
 def is_task_complete(task_dir: Path) -> bool:
-    """Check if a task has been fully evaluated (Stage 1 complete for now)."""
-    return (task_dir / "1_grounded_response.json").exists()
+    """Check if a task has been fully evaluated (all 3 stages complete)."""
+    return (task_dir / "3_autograder_results.json").exists()
 
 
 def load_tasks_from_csv(csv_path: Path) -> List[TestCase]:
@@ -114,7 +116,11 @@ def run_task(
     force: bool = False
 ) -> bool:
     """
-    Run a single task through Stage 1 (grounded call).
+    Run a single task through all 3 stages of the pipeline.
+
+    Stage 1: Grounded call (get model response)
+    Stage 2: Grounding pipeline (scrape sources)
+    Stage 3: Autograder (verify claims and score)
 
     Returns True if successful, False otherwise.
     """
@@ -128,18 +134,83 @@ def run_task(
 
     # Stage 1: Grounded call
     grounded_path = task_dir / "1_grounded_response.json"
+    grounded_response_dict = None
+
     if not grounded_path.exists() or force:
-        print(f"  Making grounded call to {model}...")
+        print(f"  Stage 1: Making grounded call to {model}...")
         try:
             grounded_response = make_grounded_call(test_case, model, grounded_path)
-            print(f"  Response: {len(grounded_response.response_text)} chars, {len(grounded_response.grounding_chunks)} URLs found")
-            print(f"  Latency: {grounded_response.latency_ms:.0f}ms")
-            return True
+            print(f"    Response: {len(grounded_response.response_text)} chars, {len(grounded_response.grounding_chunks)} URLs found")
+            print(f"    Latency: {grounded_response.latency_ms:.0f}ms")
+            with open(grounded_path) as f:
+                grounded_response_dict = json.load(f)
         except Exception as e:
-            print(f"  Error: {e}")
+            print(f"    Error: {e}")
             return False
     else:
-        print(f"  Using cached response")
+        print(f"  Stage 1: Using cached response")
+        with open(grounded_path) as f:
+            grounded_response_dict = json.load(f)
+
+    # Stage 2: Grounding pipeline (scrape sources)
+    grounding_path = task_dir / "2_scraped_sources.json"
+    grounding_result_dict = None
+
+    if not grounding_path.exists() or force:
+        print(f"  Stage 2: Running grounding pipeline...")
+        try:
+            grounding_result = run_grounding_pipeline(
+                grounded_response_dict,
+                test_case.vertical,
+                grounding_path
+            )
+            print(f"    Sources scraped: {len(grounding_result.scraped_sources)}, Failed: {len(grounding_result.failed_scrapes)}")
+            print(f"    Recommendations found: {len(grounding_result.recommendations)}")
+            with open(grounding_path) as f:
+                grounding_result_dict = json.load(f)
+        except Exception as e:
+            print(f"    Error in grounding: {e}")
+            # Create empty grounding result to continue
+            grounding_result_dict = {
+                "task_id": test_case.task_id,
+                "recommendations": [],
+                "scraped_sources": [],
+                "product_source_map": [],
+                "failed_scrapes": [],
+                "timestamp": 0,
+                "total_latency_ms": 0
+            }
+            with open(grounding_path, "w") as f:
+                json.dump(grounding_result_dict, f, indent=2)
+    else:
+        print(f"  Stage 2: Using cached grounding")
+        with open(grounding_path) as f:
+            grounding_result_dict = json.load(f)
+
+    # Stage 3: Autograder
+    autograder_path = task_dir / "3_autograder_results.json"
+
+    if not autograder_path.exists() or force:
+        print(f"  Stage 3: Running autograder...")
+        try:
+            task_result = grade_response(
+                grounded_response_dict,
+                grounding_result_dict,
+                test_case.criteria,
+                test_case.vertical,
+                autograder_path
+            )
+            print(f"    Hurdle passed: {task_result.hurdle_passed}")
+            print(f"    Total score: {task_result.total_score:.2f}")
+            print(f"    Component scores: {task_result.component_scores}")
+            return True
+        except Exception as e:
+            print(f"    Error in autograder: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    else:
+        print(f"  Stage 3: Using cached autograder results")
         return True
 
 

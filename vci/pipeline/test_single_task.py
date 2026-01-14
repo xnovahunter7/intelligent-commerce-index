@@ -12,7 +12,7 @@ import argparse
 import json
 from pathlib import Path
 
-from ..configs.providers import MODEL_PROVIDER_MAP
+from ..configs.providers import MODEL_REGISTRY
 from ..harness.grounded_call import TestCase
 from .runner import run_task, get_task_dir
 
@@ -41,8 +41,8 @@ def main():
     parser = argparse.ArgumentParser(description="Test a single VCI task")
     parser.add_argument("--task", required=True,
                         help="Task ID (e.g., VCI-ELEC-001)")
-    parser.add_argument("--model", required=True, choices=list(MODEL_PROVIDER_MAP.keys()),
-                        help="Model to test with")
+    parser.add_argument("--model", required=True,
+                        help="Model to test with (e.g., gpt-4o, gemini-2.0-flash)")
     parser.add_argument("--output-dir", type=Path, default=Path("vci/test_output"),
                         help="Output directory for test results")
     parser.add_argument("--force", action="store_true",

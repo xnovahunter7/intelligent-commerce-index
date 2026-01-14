@@ -21,7 +21,7 @@ from ..configs.settings import SETTINGS, VERTICAL_WEIGHTS, ScoringWeights
 
 
 # Grader model - use a fast, capable model for judging
-GRADER_MODEL = os.environ.get("VCI_GRADER_MODEL", "anthropic/claude-sonnet-4-20250514")
+GRADER_MODEL = os.environ.get("VCI_GRADER_MODEL", "anthropic/claude-3.5-sonnet")
 
 
 class CriterionType(Enum):
@@ -151,7 +151,7 @@ def call_grader_llm(prompt: str, max_tokens: int = 1024) -> str:
         "https://openrouter.ai/api/v1/chat/completions",
         headers=headers,
         json=payload,
-        timeout=60
+        timeout=180  # 3 minutes for complex grading
     )
 
     if response.status_code != 200:
@@ -346,20 +346,146 @@ Verify now:"""
         return False, f"Source verification error: {str(e)}", verification_details
 
 
+def map_criteria_type(criterion: Dict[str, Any]) -> CriterionType:
+    """
+    Map criterion from CSV to CriterionType enum.
+
+    CSV has:
+    - "type": "hurdle" or "grounded" (from Hurdle Tag)
+    - "criteria_type": "Helpfulness", "Safety", "Product specs", "Comparison", "Risk identification", etc.
+
+    We need to properly map these to our enum values.
+    """
+    # If it's a hurdle, that takes precedence
+    if criterion.get("type", "").lower() == "hurdle":
+        return CriterionType.HURDLE
+
+    # Map criteria_type from CSV to our enum
+    csv_type = criterion.get("criteria_type", "").lower()
+
+    if "helpfulness" in csv_type:
+        return CriterionType.HELPFULNESS
+    elif "comparison" in csv_type:
+        # Comparison quality is a form of helpfulness (going beyond minimum)
+        return CriterionType.HELPFULNESS
+    elif "risk" in csv_type:
+        # Risk identification is safety-adjacent but also helpfulness
+        return CriterionType.HELPFULNESS
+    elif "safety" in csv_type:
+        return CriterionType.SAFETY
+    elif "completeness" in csv_type:
+        return CriterionType.COMPLETENESS
+    else:
+        # Default: Product specs, Pricing, Link validity, Core requirement -> GROUNDED
+        return CriterionType.GROUNDED
+
+
+def grade_link_criterion(
+    criterion: Dict[str, Any],
+    response_text: str,
+    scraped_sources: List[Dict],
+    failed_scrapes: List[Dict]
+) -> CriterionResult:
+    """
+    Grade a link validity criterion by checking if URLs resolve.
+
+    Uses both successful scrapes and explicit link verification.
+    """
+    criterion_id = criterion.get("criterion_id", "unknown")
+    criterion_type = map_criteria_type(criterion)
+    description = criterion.get("description", "")
+
+    # Extract URLs from response text
+    url_pattern = re.compile(r'https?://[^\s<>"\'\)]+')
+    urls_in_response = url_pattern.findall(response_text)
+
+    if not urls_in_response:
+        return CriterionResult(
+            criterion_id=criterion_id,
+            criterion_type=criterion_type,
+            description=description,
+            passed=False,
+            score=0.0,
+            stage_reached=GradingStage.LINK_VERIFICATION,
+            reasoning="No URLs found in response"
+        )
+
+    # Check against scraped sources and failed scrapes
+    successful_urls = {s.get("url", "").rstrip("/") for s in scraped_sources if s.get("success")}
+    failed_urls = {f.get("url", "").rstrip("/") for f in failed_scrapes}
+
+    verified_count = 0
+    failed_count = 0
+    unverified_urls = []
+
+    for url in urls_in_response:
+        url_normalized = url.rstrip("/")
+        if url_normalized in successful_urls:
+            verified_count += 1
+        elif url_normalized in failed_urls:
+            failed_count += 1
+        else:
+            # URL wasn't scraped, try direct verification
+            link_ok, reason = verify_link(url)
+            if link_ok:
+                verified_count += 1
+            else:
+                failed_count += 1
+                unverified_urls.append(f"{url}: {reason}")
+
+    # Score based on verification results
+    total_urls = len(urls_in_response)
+
+    if failed_count > 0:
+        # At least one link failed
+        score = max(0, (verified_count - failed_count) / total_urls)
+        passed = False
+        reasoning = f"{failed_count}/{total_urls} links failed verification"
+        if unverified_urls:
+            reasoning += f". Failed: {unverified_urls[:3]}"
+    else:
+        score = 1.0
+        passed = True
+        reasoning = f"All {verified_count} links verified successfully"
+
+    return CriterionResult(
+        criterion_id=criterion_id,
+        criterion_type=criterion_type,
+        description=description,
+        passed=passed,
+        score=score,
+        stage_reached=GradingStage.LINK_VERIFICATION,
+        reasoning=reasoning,
+        verification_details={
+            "total_urls": total_urls,
+            "verified": verified_count,
+            "failed": failed_count
+        }
+    )
+
+
 def grade_criterion(
     criterion: Dict[str, Any],
     response_text: str,
     recommendations: List[str],
     product_source_map: List[Dict],
-    scraped_sources: List[Dict]
+    scraped_sources: List[Dict],
+    failed_scrapes: List[Dict] = None
 ) -> CriterionResult:
     """
     Grade a single criterion through the two-stage process.
     """
+    if failed_scrapes is None:
+        failed_scrapes = []
+
     criterion_id = criterion.get("criterion_id", "unknown")
-    criterion_type = CriterionType(criterion.get("type", "grounded").lower())
+    criterion_type = map_criteria_type(criterion)
     description = criterion.get("description", "")
     is_grounded = criterion.get("grounded_status", "Grounded") == "Grounded"
+
+    # Special handling for link criteria - use dedicated link grader
+    if "link" in description.lower() and any(word in description.lower() for word in ["works", "valid", "resolves", "correct"]):
+        return grade_link_criterion(criterion, response_text, scraped_sources, failed_scrapes)
 
     # Stage 1: Response text validation
     stage1_passed, stage1_reasoning, product_results = grade_response_text(
@@ -378,7 +504,7 @@ def grade_criterion(
             product_results=product_results
         )
 
-    # Non-grounded criteria: done after stage 1
+    # Non-grounded criteria (helpfulness, safety, etc.): done after stage 1
     if not is_grounded:
         return CriterionResult(
             criterion_id=criterion_id,
@@ -391,48 +517,61 @@ def grade_criterion(
             product_results=product_results
         )
 
-    # Special handling for link criteria
-    if "link" in description.lower():
-        # TODO: Implement link verification
-        return CriterionResult(
-            criterion_id=criterion_id,
-            criterion_type=criterion_type,
-            description=description,
-            passed=False,
-            score=0.0,
-            stage_reached=GradingStage.LINK_VERIFICATION,
-            reasoning="Link verification not implemented"
-        )
-
-    # Stage 2: Source verification
+    # Stage 2: Source verification for grounded criteria
     stage2_passed, stage2_reasoning, verification_details = grade_against_sources(
         criterion, product_source_map, scraped_sources, response_text
     )
 
+    # Track if failure was due to scraping issues vs actual hallucination
+    # Check both success flag AND content quality (blocked pages have minimal content)
+    def is_useful_content(source: Dict) -> bool:
+        if not source.get("success"):
+            return False
+        content = source.get("content", "")
+        # Blocked pages typically have very short content or contain bot detection phrases
+        blocked_indicators = [
+            "continue shopping",
+            "access denied",
+            "robot check",
+            "captcha",
+            "please verify",
+            "blocked",
+        ]
+        if len(content) < 500:  # Too short to be useful product page
+            return False
+        content_lower = content.lower()
+        if any(indicator in content_lower for indicator in blocked_indicators):
+            return False
+        return True
+
+    useful_sources = [s for s in scraped_sources if is_useful_content(s)]
+    scrape_failure = len(useful_sources) == 0
+
     if not stage2_passed:
-        # Passed response text but failed source verification
-        if SETTINGS.conservative_grading:
-            # Can't verify = unverifiable, not wrong
+        # Determine score based on failure type
+        if scrape_failure:
+            # Infrastructure failure - don't penalize model
             return CriterionResult(
                 criterion_id=criterion_id,
                 criterion_type=criterion_type,
                 description=description,
                 passed=False,
-                score=0.0,  # Conservative: unverifiable counts as 0
+                score=0.0,  # Neutral - couldn't verify
                 stage_reached=GradingStage.GROUNDED_SOURCES,
-                reasoning=f"Unverifiable: {stage2_reasoning}",
-                verification_details=verification_details
+                reasoning=f"Scrape failure - unverifiable: {stage2_reasoning}",
+                verification_details={**verification_details, "scrape_failure": True}
             )
         else:
+            # Sources available but claim not supported - potential hallucination
             return CriterionResult(
                 criterion_id=criterion_id,
                 criterion_type=criterion_type,
                 description=description,
                 passed=False,
-                score=-1.0,  # Failed at source verification
+                score=-1.0,  # Penalty for hallucination
                 stage_reached=GradingStage.GROUNDED_SOURCES,
-                reasoning=stage2_reasoning,
-                verification_details=verification_details
+                reasoning=f"Not grounded in sources: {stage2_reasoning}",
+                verification_details={**verification_details, "hallucination": True}
             )
 
     return CriterionResult(
@@ -518,6 +657,7 @@ def grade_response(
     recommendations = grounding_result.get("recommendations", [])
     product_source_map = grounding_result.get("product_source_map", [])
     scraped_sources = grounding_result.get("scraped_sources", [])
+    failed_scrapes = grounding_result.get("failed_scrapes", [])
 
     # Grade criteria in parallel
     criterion_results = []
@@ -530,7 +670,8 @@ def grade_response(
                 response_text,
                 recommendations,
                 product_source_map,
-                scraped_sources
+                scraped_sources,
+                failed_scrapes
             ): criterion
             for criterion in criteria
         }

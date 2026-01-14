@@ -116,7 +116,7 @@ def classify_url(url: str) -> str:
         return "webpage"
 
 
-def scrape_url(url: str, retries: int = None, timeout: int = 15) -> ScrapedSource:
+def scrape_url(url: str, retries: int = None, timeout: int = 30) -> ScrapedSource:
     """
     Scrape a URL and return structured content.
 

@@ -16,17 +16,15 @@ from pathlib import Path
 from typing import List
 
 from ..configs.settings import VERTICALS
-from ..configs.providers import MODEL_PROVIDER_MAP
+from ..configs.providers import MODEL_REGISTRY
 
 
 # Default models to evaluate
 DEFAULT_MODELS = [
     "gpt-4o",
-    "gpt-4o-mini",
-    "claude-sonnet-4-5-20250514",
+    "claude-3.5-sonnet",
     "gemini-2.0-flash",
-    "gemini-2.5-pro",
-    "sonar-pro",
+    "sonar",
 ]
 
 
@@ -79,7 +77,7 @@ def main():
                         help="Run number (default: 1)")
     parser.add_argument("--dataset", choices=["dev", "eval"], default="dev",
                         help="Dataset to use (default: dev)")
-    parser.add_argument("--models", nargs="+", choices=list(MODEL_PROVIDER_MAP.keys()),
+    parser.add_argument("--models", nargs="+",
                         default=DEFAULT_MODELS,
                         help="Models to evaluate (default: all)")
     parser.add_argument("--max-parallel", type=int, default=4,
